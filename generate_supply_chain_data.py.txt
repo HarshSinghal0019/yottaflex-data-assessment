@@ -1,0 +1,142 @@
+import pandas as pd
+import numpy as np
+import random
+from datetime import datetime, timedelta
+import json
+import os
+
+# Step 1 & 4: Configuration and Fixed Seed
+SEED = 20261022
+np.random.seed(SEED)
+random.seed(SEED)
+
+NUM_SKUS = 2000
+NUM_STORES = 100
+DAYS_OF_HISTORY = 365
+START_DATE = datetime(2025, 1, 1)
+
+OUTPUT_DIR = "output_data"
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+print(f"Generating synthetic data with seed {SEED}...")
+
+# 1. Master Data Generation
+stores = pd.DataFrame({
+    'store_id': [f"STORE-{str(i).zfill(6)}" for i in range(1, NUM_STORES + 1)],
+    'region': np.random.choice(['North', 'South', 'East', 'West'], NUM_STORES),
+    'capacity_units': np.random.randint(5000, 20000, NUM_STORES)
+})
+
+skus = pd.DataFrame({
+    'sku_id': [f"SKU-{str(i).zfill(6)}" for i in range(1, NUM_SKUS + 1)],
+    'category': np.random.choice(['Electronics', 'Apparel', 'Grocery', 'Home'], NUM_SKUS),
+    'unit_cost': np.round(np.random.uniform(5.0, 150.0), 2),
+    'lifecycle_state': np.random.choice(['Active', 'Active', 'Active', 'Discontinued'], NUM_SKUS)
+})
+
+suppliers = pd.DataFrame({
+    'supplier_id': [f"SUP-{str(i).zfill(6)}" for i in range(1, 51)],
+    'reliability_score': np.round(np.random.uniform(0.7, 1.0), 2)
+})
+
+# Bridge Table: SupplierSKU (N:M)
+supplier_skus = pd.DataFrame({
+    'sku_id': skus['sku_id'],
+    'supplier_id': np.random.choice(suppliers['supplier_id'], NUM_SKUS),
+    'pack_size': np.random.choice([10, 20, 50, 100], NUM_SKUS),
+    'moq': np.random.choice([100, 200, 500], NUM_SKUS),
+    'base_lead_time_days': np.random.randint(3, 15, NUM_SKUS)
+})
+
+# 2. Transaction / Event Data Generation (Sales & Inventory)
+dates = [START_DATE + timedelta(days=i) for i in range(DAYS_OF_HISTORY)]
+# For performance in this template, we generate a subset matrix (e.g., 100 Stores x 100 SKUs)
+# To generate the full 2000x100 matrix locally, adjust the subset logic below.
+subset_skus = skus['sku_id'].sample(100, random_state=SEED).values 
+
+sales_records = []
+inventory_records = []
+ground_truth = []
+
+for store in stores['store_id'].values[:10]: # Limiting to 10 stores for quick test execution
+    for sku in subset_skus:
+        current_stock = np.random.randint(50, 200)
+        is_discontinued = skus.loc[skus['sku_id'] == sku, 'lifecycle_state'].values[0] == 'Discontinued'
+        
+        for date in dates:
+            # Base demand with seasonality and intermittent zeroes
+            demand = int(max(0, np.random.normal(5, 3)))
+            if random.random() < 0.2: # 20% chance of zero intermittent demand
+                demand = 0
+            
+            # Record stockout explicitly vs zero demand
+            stockout_flag = False
+            sales_qty = demand
+            if demand > current_stock:
+                sales_qty = current_stock
+                stockout_flag = True
+                
+            # Edge Case 1: Stockout mistaken for zero demand (System logs 0 sales, but demand existed)
+            if stockout_flag and random.random() < 0.05:
+                sales_qty = 0
+                ground_truth.append({'issue_type': 'Stockout_Censoring', 'store_id': store, 'sku_id': sku, 'date': date.strftime('%Y-%m-%d')})
+
+            sales_records.append({
+                'sale_id': f"SALE-{store}-{sku}-{date.strftime('%Y%m%d')}",
+                'store_id': store,
+                'sku_id': sku,
+                'date': date.strftime('%Y-%m-%d'),
+                'sales_qty': sales_qty,
+                'stockout_flag': stockout_flag
+            })
+            
+            current_stock = max(0, current_stock - sales_qty)
+            # Simulate basic replenishment
+            if current_stock < 20:
+                current_stock += np.random.choice([50, 100])
+
+sales_df = pd.DataFrame(sales_records)
+
+# 3. Reorder Policy & Purchase Recommendations (Edge Cases Injected)
+recs = []
+for idx, row in supplier_skus.head(200).iterrows():
+    sku = row['sku_id']
+    store = stores['store_id'].sample(1).values[0]
+    rec_qty = row['moq'] + row['pack_size'] * np.random.randint(1, 5)
+    lead_time = row['base_lead_time_days']
+    
+    # Edge Case 2: Reorder quantity ignores pack size
+    if random.random() < 0.1:
+        rec_qty = rec_qty + np.random.randint(1, row['pack_size'] - 1)
+        ground_truth.append({'issue_type': 'Ignores_Pack_Size', 'sku_id': sku, 'rec_qty': rec_qty})
+        
+    # Edge Case 3: Negative lead time
+    if random.random() < 0.05:
+        lead_time = -1
+        ground_truth.append({'issue_type': 'Negative_Lead_Time', 'sku_id': sku})
+        
+    # Edge Case 4: Discontinued SKU recommended
+    if skus.loc[skus['sku_id'] == sku, 'lifecycle_state'].values[0] == 'Discontinued':
+        ground_truth.append({'issue_type': 'Discontinued_SKU_Recommended', 'sku_id': sku})
+
+    recs.append({
+        'po_id': f"PO-2026-{str(len(recs)+1).zfill(6)}",
+        'store_id': store,
+        'sku_id': sku,
+        'recommended_qty': rec_qty,
+        'expected_lead_time': lead_time
+    })
+recs_df = pd.DataFrame(recs)
+
+# Step 9: Export Data
+stores.to_csv(f"{OUTPUT_DIR}/stores.csv", index=False)
+skus.to_csv(f"{OUTPUT_DIR}/skus.csv", index=False)
+suppliers.to_csv(f"{OUTPUT_DIR}/suppliers.csv", index=False)
+supplier_skus.to_csv(f"{OUTPUT_DIR}/supplier_skus.csv", index=False)
+sales_df.to_csv(f"{OUTPUT_DIR}/sales_history.csv", index=False)
+recs_df.to_csv(f"{OUTPUT_DIR}/purchase_recommendations.csv", index=False)
+
+with open(f"{OUTPUT_DIR}/ground_truth.json", "w") as f:
+    json.dump(ground_truth, f, indent=4)
+
+print("Data generation complete. Files saved to output_data/ directory.")
